@@ -1,3 +1,4 @@
+import random
 import logging
 import os
 import sys
@@ -194,6 +195,7 @@ def main():
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        # format=' ┇ '.join(['%(pathname)120s:%(lineno)-5d', '%(asctime)s', '%(levelname)-8s', '%(name)48s', '%(message)s']),
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
@@ -208,12 +210,13 @@ def main():
     # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16 or training_args.bf16}"
+        f", distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16 or training_args.bf16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+    ran = random.Random(training_args.seed)
     if not data_args.no_load_gner_customized_datasets:
         raw_datasets = load_dataset(
             os.path.join(CURRENT_DIR, "gner_dataset.py"),
@@ -240,16 +243,31 @@ def main():
         trust_remote_code=model_args.trust_remote_code,
     )
     is_encoder_decoder = config.is_encoder_decoder
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
+    if is_encoder_decoder:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+    else:  # https://github.com/Vision-CAIR/MiniGPT-4/issues/129
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+            padding_side="left",
+            add_eos_token=True,
+            add_bos_token=True,
+        )
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.unk_token
+        # tokenizer.pad_token = tokenizer.eos_token  # https://medium.com/@rschaeffer23/how-to-fine-tune-llama-3-1-8b-instruct-bf0a84af7795
+        tokenizer.pad_token = tokenizer.unk_token if tokenizer.unk_token else tokenizer.eos_token  # https://stackoverflow.com/questions/70544129/transformers-asking-to-pad-but-the-tokenizer-does-not-have-a-padding-token
+        # tokenizer.add_special_tokens({'pad_token': "<pad>"})  # https://stackoverflow.com/questions/70544129/transformers-asking-to-pad-but-the-tokenizer-does-not-have-a-padding-token
     MODEL_CLASS = AutoModelForSeq2SeqLM if is_encoder_decoder else AutoModelForCausalLM
     model = MODEL_CLASS.from_pretrained(
         model_args.model_name_or_path,
@@ -260,6 +278,8 @@ def main():
         token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
     )
+    # model.resize_token_embeddings(len(tokenizer))  # https://stackoverflow.com/questions/70544129/transformers-asking-to-pad-but-the-tokenizer-does-not-have-a-padding-token
+    model.generation_config.pad_token_id = tokenizer.pad_token_id  # https://stackoverflow.com/questions/69609401/suppress-huggingface-logging-warning-setting-pad-token-id-to-eos-token-id
 
     def preprocess_function(example):
         # remove pairs where at least one record is None
@@ -344,8 +364,8 @@ def main():
         if data_args.train_json_dir is not None:
             train_dataset = load_dataset("json", data_files=data_args.train_json_dir, split="train")
             logger.info(f"Use {data_args.train_json_dir} as train dataset, len(dataset) = {len(train_dataset)}")
-        elif "train" in raw_datasets:
-            train_dataset = raw_datasets["train"]
+        elif datasets.Split.TRAIN in raw_datasets:
+            train_dataset = raw_datasets[datasets.Split.TRAIN]
         else:
             raise ValueError("--do_train requires a train dataset")
 
@@ -367,14 +387,16 @@ def main():
         if data_args.valid_json_dir is not None:
             eval_dataset = load_dataset("json", data_files=data_args.valid_json_dir, split="train")
             logger.info(f"Use {data_args.valid_json_dir} as valid dataset, len(dataset) = {len(eval_dataset)}")
-        elif "valid" in raw_datasets:
-            eval_dataset = raw_datasets["validation"]
+        elif datasets.Split.VALIDATION in raw_datasets:
+            eval_dataset = raw_datasets[datasets.Split.VALIDATION]
         else:
             raise ValueError("--do_eval requires a validation dataset")
 
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
-            eval_dataset = eval_dataset.select(range(max_eval_samples))
+            whole_indices = list(range(len(eval_dataset)))
+            ran.shuffle(whole_indices)  # randomize the indices
+            eval_dataset = eval_dataset.select(whole_indices[:max_eval_samples])
 
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
             eval_dataset = eval_dataset.map(
@@ -389,8 +411,8 @@ def main():
         if data_args.test_json_dir is not None:
             predict_dataset = load_dataset("json", data_files=data_args.test_json_dir, split="train")
             logger.info(f"Use {data_args.test_json_dir} as predict dataset, len(dataset) = {len(predict_dataset)}")
-        elif "test" in raw_datasets:
-            predict_dataset = raw_datasets["test"]
+        elif datasets.Split.TEST in raw_datasets:
+            predict_dataset = raw_datasets[datasets.Split.TEST]
         else:
             raise ValueError("--do_predict requires a test dataset")
 
@@ -422,7 +444,7 @@ def main():
     # and some of the information will also be used in evaluation.
     training_args.remove_unused_columns = False
 
-    def compute_ner_metrics(dataset, preds, save_prefix=None):
+    def compute_ner_metrics(dataset, preds, save_prefix=None, save_suffix=None, **kwargs):
         preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
         if not is_encoder_decoder:
@@ -436,7 +458,7 @@ def main():
 
         results = compute_metrics(all_examples, tokenizer=tokenizer)
         if save_prefix is not None:
-            with open(os.path.join(training_args.output_dir, f"{save_prefix}_text_generations.jsonl"), "w") as fout:
+            with open(os.path.join(training_args.output_dir, f"{save_prefix}_text_generations{'_' + save_suffix if save_suffix else ''}.jsonl"), "w") as fout:
                 for example in all_examples:
                     fout.write(json.dumps(example) + "\n")
         return results
@@ -447,7 +469,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `GNERTrainer.__init__`. Use `processing_class` instead.
         data_collator=data_collator,
         compute_metrics=compute_ner_metrics if training_args.predict_with_generate else None,
     )

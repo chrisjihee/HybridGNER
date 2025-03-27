@@ -1,10 +1,16 @@
+import argparse
 import json
 import re
 import string
 from collections import defaultdict
+from typing import List, Dict, Any, Optional
+
+from nltk import edit_distance
+from pydantic import BaseModel
+
+from chrisdata.learn import F1
+from chrisdata.ner import GenNERSampleWrapper
 from transformers import AutoTokenizer
-from tqdm import tqdm
-import argparse
 
 
 # extract words and corresponding labels in the generation texts
@@ -19,6 +25,7 @@ def extract(preds_text):
             labels.append(label.strip())
         pre_bound = r
     return words, labels
+
 
 # judge if b exist as a subsequence of a
 # if true, return the corresponding match index between a and b
@@ -36,6 +43,7 @@ def contains_in_order(a, b):
             if idx_b == m:
                 return match_idx
     return False
+
 
 # Traditional LCS solution
 # the complexity is O(N^2)
@@ -62,6 +70,7 @@ def lcs_solve(a, b):
         i, j = u, v
     return match_idx
 
+
 # A fast version of LCS with a complexity of O(NlogN)
 # in the condiction that there are few depulicate words in the sentence
 # input: a = [word_1, word_2, ..., word_n], b = [word_1, word_2, ..., word_m]
@@ -70,7 +79,7 @@ def lcs_solve_fast(a, b):
     n, m = len(a), len(b)
     match_idx = [-1] * n
     match_list_b = defaultdict(list)
-    
+
     # First we can convert the LCS problem into a LIS problem,
     # i.e., LCS(a, b) <=> LIS(index_list)
     for idx, word in enumerate(reversed(b)):
@@ -133,8 +142,9 @@ def hierarchical_matching(raw_words, words, labels, tokenizer=None):
     match_labels = [labels[idx] if idx != -1 and labels[idx] else 'O' for idx in match_idx]
     return match_labels
 
+
 # convert the unstructured texts into structured entities
-def extract_predictions(example, tokenizer=None):
+def extract_predictions(example: Dict[str, Any], tokenizer=None):
     pred_words, pred_labels = extract(example['prediction'].strip())
     valid_labels = []
     for label in example['label_list']:
@@ -146,22 +156,57 @@ def extract_predictions(example, tokenizer=None):
     assert len(predictions) == len(example['instance']['labels'])
     return predictions
 
-# normalize answer, 
+
+# convert the unstructured texts into structured entities
+def extract_predictions2(example: GenNERSampleWrapper, tokenizer=None):
+    pred_words, pred_labels = extract(example.instance.prediction_output.strip())
+    valid_labels = []
+    for label in example.label_list:
+        valid_labels.extend([f'B-{label}', f'I-{label}'])
+    for i, label in enumerate(pred_labels):
+        if label not in valid_labels:
+            pred_labels[i] = "O"
+    predictions = hierarchical_matching(example.instance.words, pred_words, pred_labels, tokenizer=tokenizer)
+    assert len(predictions) == len(example.instance.labels)
+    return predictions
+
+
+# convert the unstructured texts into structured entities
+def extract_predictions3(prediction_output: str, example: GenNERSampleWrapper, tokenizer=None):
+    pred_words, pred_labels = extract(prediction_output.strip())
+    valid_labels = []
+    for label in example.label_list:
+        valid_labels.extend([f'B-{label}', f'I-{label}'])
+    for i, label in enumerate(pred_labels):
+        if label not in valid_labels:
+            pred_labels[i] = "O"
+    predictions = hierarchical_matching(example.instance.words, pred_words, pred_labels, tokenizer=tokenizer)
+    assert len(predictions) == len(example.instance.labels)
+    return predictions
+
+
+# normalize answer,
 # cp from https://github.com/universal-ner/universal-ner/blob/main/src/eval/evaluate.py
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
+
     def remove_articles(text):
         return re.sub(r'\b(a|an|the)\b', ' ', text)
+
     def white_space_fix(text):
         return ' '.join(text.split())
+
     def remove_punc(text):
         exclude = set(string.punctuation)
         return ''.join(ch for ch in text if ch not in exclude)
+
     def lower(text):
         return text.lower()
+
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-# parser BIO format into entity format, 
+
+# parser BIO format into entity format,
 # modified from https://github.com/universal-ner/universal-ner/blob/main/src/eval/evaluate.py
 def parser(words, labels):
     assert len(words) == len(labels)
@@ -186,12 +231,13 @@ def parser(words, labels):
             formatted_items.append(item)
     return formatted_items
 
+
 # compute F1 score
 # modified from https://github.com/universal-ner/universal-ner/blob/main/src/eval/evaluate.py
 class NEREvaluator:
-    def evaluate(self, examples: list, tokenizer):
+    def evaluate(self, examples: List[Dict[str, Any]], tokenizer):
         n_correct, n_pos_gold, n_pos_pred = 0, 0, 0
-        for example in tqdm(examples):
+        for example in examples:
             words = example['instance']['words']
             labels = example['instance']['labels']
             predictions = extract_predictions(example, tokenizer)
@@ -206,12 +252,53 @@ class NEREvaluator:
         recall = n_correct / (n_pos_gold + 1e-10)
         f1 = 2 * prec * recall / (prec + recall + 1e-10)
         return {
-            'precision': prec,
-            'recall': recall,
+            'prec': prec,
+            'rec': recall,
             'f1': f1,
         }
 
-def compute_metrics(examples, tokenizer=None):
+    def evaluate2(self, examples: List[GenNERSampleWrapper], tokenizer) -> dict[str, float]:
+        n_correct, n_pos_gold, n_pos_pred = 0, 0, 0
+        for example in examples:
+            words = example.instance.words
+            labels = example.instance.labels
+            predictions = extract_predictions2(example, tokenizer)
+            gold_tuples = parser(words, labels)
+            pred_tuples = parser(words, predictions)
+            for t in pred_tuples:
+                if t in gold_tuples:
+                    n_correct += 1
+                n_pos_pred += 1
+            n_pos_gold += len(gold_tuples)
+        prec = n_correct / (n_pos_pred + 1e-10)
+        rec = n_correct / (n_pos_gold + 1e-10)
+        f1 = 2 * prec * rec / (prec + rec + 1e-10)
+        return {
+            'prec': prec,
+            'rec': rec,
+            'f1': f1,
+        }
+
+    def evaluate_prediction(self, prediction_output: str, example: GenNERSampleWrapper, tokenizer) -> F1:
+        n_correct, n_pos_gold, n_pos_pred = 0, 0, 0
+        words = example.instance.words
+        labels = example.instance.labels
+        predictions = extract_predictions3(prediction_output, example=example, tokenizer=tokenizer)
+        gold_tuples = parser(words, labels)
+        pred_tuples = parser(words, predictions)
+        for t in pred_tuples:
+            if t in gold_tuples:
+                n_correct += 1
+            n_pos_pred += 1
+        n_pos_gold += len(gold_tuples)
+        return F1(
+            n_correct=n_correct,
+            n_pos_gold=n_pos_gold,
+            n_pos_pred=n_pos_pred,
+        )
+
+
+def compute_metrics(examples: List[Dict[str, Any]], tokenizer=None, average_key="average", detailed=False):
     all_examples = defaultdict(list)
     for example in examples:
         all_examples[example['dataset']].append(example)
@@ -221,13 +308,82 @@ def compute_metrics(examples, tokenizer=None):
     tot_f1, tot_dataset = 0, 0
     for dataset in all_examples:
         eval_result = NEREvaluator().evaluate(all_examples[dataset], tokenizer=tokenizer)
-        results[f"{dataset}_precision"] = eval_result["precision"]
-        results[f"{dataset}_recall"] = eval_result["recall"]
-        results[f"{dataset}_f1"] = eval_result["f1"]
+        if detailed:
+            results[f"{dataset}_prec"] = eval_result["prec"]
+            results[f"{dataset}_rec"] = eval_result["rec"]
+            results[f"{dataset}_f1"] = eval_result["f1"]
+        else:
+            results[dataset] = eval_result["f1"]
         tot_f1 += eval_result["f1"]
         tot_dataset += 1
-    results["average_f1"] = tot_f1 / tot_dataset
+    if detailed:
+        results[f"{average_key}_f1"] = tot_f1 / tot_dataset
+    else:
+        results[average_key] = tot_f1 / tot_dataset
     return results
+
+
+def compute_metrics2(examples: List[GenNERSampleWrapper], tokenizer=None, average_key="average", detailed=False) -> dict[str, float]:
+    all_examples = defaultdict(list)
+    for example in examples:
+        all_examples[example.dataset].append(example)
+
+    # evaluate
+    evaluator = NEREvaluator()
+    results = {}
+    tot_f1, tot_dataset = 0, 0
+    for dataset in all_examples:
+        eval_result = evaluator.evaluate2(all_examples[dataset], tokenizer=tokenizer)
+        if detailed:
+            results[f"{dataset}_prec"] = eval_result["prec"]
+            results[f"{dataset}_rec"] = eval_result["rec"]
+            results[f"{dataset}_f1"] = eval_result["f1"]
+        else:
+            results[dataset] = eval_result["f1"]
+        tot_f1 += eval_result["f1"]
+        tot_dataset += 1
+    if detailed:
+        results[f"{average_key}_f1"] = tot_f1 / tot_dataset
+    else:
+        results[average_key] = tot_f1 / tot_dataset
+    return results
+
+
+def normalized_edit_distance(hyp_text: str, ref_text: str) -> float:
+    dist = edit_distance(ref_text, hyp_text)
+    max_len = max(len(ref_text), len(hyp_text))
+    norm_dist = dist / max_len if max_len else 0.0
+    return norm_dist
+
+
+class PredictionQuality(BaseModel):
+    prediction: str
+    sentence: Optional[str] = None
+    dataset: Optional[str] = None
+    id: Optional[str] = None
+    f1_info: Optional[F1] = None
+    edit_dist: Optional[float] = None
+    quality: Optional[float] = None
+
+    @staticmethod
+    def calc_f1_info(prediction: str, example: GenNERSampleWrapper, tokenizer):
+        return NEREvaluator().evaluate_prediction(prediction, example, tokenizer)
+
+    @staticmethod
+    def calc_edit_dist(prediction: str, reference: str):
+        return normalized_edit_distance(prediction, reference)
+
+    @staticmethod
+    def calc_quality(f1: float, edit_dist: float, weight_f1: float = 0.7, weight_ed: float = 0.3, pow_weight: float = 2.0, max_score: float = 5.0):
+        score = sum([
+            weight_f1 * f1,
+            weight_ed * (1.0 - edit_dist),
+        ])
+        return round(pow(score, pow_weight) * max_score, 1)
+
+    def __str__(self):
+        return f"Q={self.quality:.2f}, F1={self.f1_info.f1:.4f}, ED={self.edit_dist:.4f}, pred={self.prediction}"
+
 
 def main():
     parser = argparse.ArgumentParser()

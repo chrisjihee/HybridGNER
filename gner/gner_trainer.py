@@ -1,18 +1,208 @@
-import torch
-from transformers import GenerationConfig
-from transformers.trainer_seq2seq import Seq2SeqTrainer
+from typing import List
+
+import pandas as pd
+from pydantic import BaseModel
+
+from chrisbase.io import LoggerWriter, hr
+from progiter import ProgIter
+from transformers import Trainer, IntervalStrategy
 from transformers.trainer import *
+from transformers.trainer_seq2seq import Seq2SeqTrainer
+
+logger = logging.get_logger(__name__)
+
+
+class EmptyDataset(Dataset):
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, index):
+        raise IndexError("This dataset is empty.")
+
+
+class SingleItemDataset(Dataset):
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        if idx != 0:
+            raise IndexError("SingleItemDataset에는 단 하나의 아이템만 존재합니다.")
+        return {
+            "input_ids": torch.tensor([0]),
+            "attention_mask": torch.tensor([1]),
+            "labels": torch.tensor([0]),
+        }
+
+
+class TrainingValues(BaseModel):
+    num_train_epochs: float
+    num_update_steps_per_epoch: int
+    num_examples: int
+    num_train_samples: float
+    epoch_based: bool
+    len_dataloader: int
+    max_steps: int
+    total_train_batch_size: int
+
+    @classmethod
+    def from_trainer(cls, trainer: Trainer):
+        total_train_batch_size = trainer.args.world_size * trainer._train_batch_size * trainer.args.gradient_accumulation_steps
+        values = trainer.set_initial_training_values(
+            args=trainer.args,
+            dataloader=trainer.get_train_dataloader() if trainer.args.do_train else DataLoader(SingleItemDataset()),
+            total_train_batch_size=total_train_batch_size
+        )
+        return cls(**dict(zip(cls.__annotations__.keys(), list(values) + [total_train_batch_size])))
+
+
+class CustomProgressCallback(TrainerCallback):
+
+    def __init__(
+            self,
+            trainer: "GNERTrainer",
+            metric_file: str | Path,
+            logging_epochs: float = -1,
+            eval_at_step: int = -1,
+            eval_epochs: float = -1,
+            save_epochs: float = -1,
+            progress_seconds: float = 3.0,
+            metric_formats: Mapping[str, str] | None = None,
+    ):
+        super().__init__()
+        self.trainer: Trainer = trainer
+        self.metric_file: str | Path = metric_file
+        self.training_values: TrainingValues = TrainingValues.from_trainer(trainer)
+        self.progress_seconds: float = progress_seconds
+
+        self.training_pbar: Optional[ProgIter] = None
+        self.current_step: int = 0
+        self.metrics_table: pd.DataFrame = pd.DataFrame()
+        self.metric_formats: Mapping[str, str] | None = metric_formats
+
+        self.logging_step_set = set()
+        self.eval_step_set = set() if eval_at_step <= 0 else {eval_at_step}
+        self.save_step_set = set()
+        if 0 < logging_epochs:
+            for i in range(int(math.ceil(self.training_values.num_train_epochs) / logging_epochs)):
+                self.logging_step_set.add(round(self.training_values.num_update_steps_per_epoch * logging_epochs * (i + 1)))
+        if 0 < eval_epochs:
+            for i in range(int(math.ceil(self.training_values.num_train_epochs) / eval_epochs)):
+                self.eval_step_set.add(round(self.training_values.num_update_steps_per_epoch * eval_epochs * (i + 1)))
+        if 0 < save_epochs:
+            for i in range(int(math.ceil(self.training_values.num_train_epochs) / save_epochs)):
+                self.save_step_set.add(round(self.training_values.num_update_steps_per_epoch * save_epochs * (i + 1)))
+
+    def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if state.is_world_process_zero:
+            logger.info(hr(c='-'))
+            logger.info(f"***** Beginning Training *****")
+            logger.info(f">> Train Epochs       = {self.trainer.args.num_train_epochs}")
+            logger.info(f">> Train Examples     = {self.training_values.num_examples:,}")
+            logger.info(f">> Train Batch Size   = {self.training_values.total_train_batch_size:,}"
+                        f" = {self.trainer._train_batch_size} * {self.trainer.args.gradient_accumulation_steps}(gas) * {self.trainer.args.world_size}(gpu)")
+            logger.info(f">> Train Optim Steps  = {self.training_values.max_steps:,}"
+                        f" = {self.training_values.num_update_steps_per_epoch:,} * {self.trainer.args.num_train_epochs}(ep)")
+            logger.info(f">> Train Model Type   = {self.trainer.model.config.model_type}")
+            logger.info(f">> Train Model Path   = {self.trainer.model.name_or_path}")
+            logger.info(f">> Train Model Class  = {self.trainer.model.__class__.__name__}")
+            logger.info(f">> Train Model Params = {get_model_param_count(self.trainer.model, trainable_only=True):,}")
+            logger.info(f">> Trainer Callbacks  = {', '.join(type(x).__name__ for x in self.trainer.callback_handler.callbacks)}")
+            if self.trainer.accelerator.state.deepspeed_plugin:
+                logger.info(f">> Zero Optim Stage   = {self.trainer.accelerator.state.deepspeed_plugin.deepspeed_config['zero_optimization']['stage']}")
+            if self.trainer.eval_dataset:
+                logger.info(f">> Eval Examples      = {len(self.trainer.eval_dataset):,}")
+                logger.info(f">> Eval Batch Size    = {self.trainer.args.per_device_eval_batch_size * self.trainer.args.world_size:,}"
+                            f" = {self.trainer.args.per_device_eval_batch_size} * {self.trainer.args.world_size}(gpu)")
+            self.training_pbar = ProgIter(
+                time_thresh=self.progress_seconds,
+                verbose=3,
+                stream=LoggerWriter(logger),
+                total=state.max_steps,
+                desc="[training]",
+            )
+            self.training_pbar.begin()
+        self.current_step = 0
+
+    def epoch_by_step(self, state: TrainerState):
+        state.epoch = state.global_step / self.training_values.num_update_steps_per_epoch
+        return state.epoch
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.training_pbar is not None:
+            self.training_pbar.step(state.global_step - self.current_step, display=False)
+        self.current_step = state.global_step
+        control.should_log = control.should_log or self.current_step in self.logging_step_set
+        control.should_save = control.should_save or self.current_step in self.save_step_set
+        should_not_evaluate = ((args.eval_strategy == IntervalStrategy.STEPS and state.global_step < args.eval_delay) or
+                               (args.eval_strategy != IntervalStrategy.STEPS and self.epoch_by_step(state) < args.eval_delay))
+        control.should_evaluate = not should_not_evaluate and (control.should_evaluate or self.current_step in self.eval_step_set)
+
+    def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        control.should_log = True
+        if self.training_pbar is not None:
+            self.training_pbar.end()
+            self.training_pbar = None
+            logger.info(hr(c='-'))
+
+    def on_prediction_step(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, eval_dataloader=None, **kwargs):
+        if state.is_world_process_zero:
+            if eval_dataloader and has_length(eval_dataloader):
+                if self.trainer.prediction_pbar is not None:
+                    self.trainer.prediction_pbar.step()
+
+    def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.trainer.prediction_pbar is not None:
+            self.trainer.prediction_pbar.end()
+            self.trainer.prediction_pbar = None
+            if self.training_pbar is not None:
+                self.training_pbar.display_message()
+
+    def on_predict(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if self.trainer.prediction_pbar is not None:
+            self.trainer.prediction_pbar.end()
+            self.trainer.prediction_pbar = None
+            if self.training_pbar is not None:
+                self.training_pbar.display_message()
+
+    def on_log(self, args: TrainingArguments, state: TrainerState, control: TrainerControl,
+               logs: Optional[Mapping[str, Any]] = None, exclude_keys=("epoch", "step"), **kwargs):
+        if state.is_world_process_zero:
+            metrics = {
+                "step": state.global_step,
+                "epoch": round(self.epoch_by_step(state), 3),
+            }
+            for k, v in logs.items():
+                if k not in exclude_keys:
+                    metrics[k] = v
+                    if k.endswith("_flos"):
+                        metrics[k.replace("_flos", "_pflos")] = v / 1e15
+            new_metrics_row = pd.DataFrame([metrics])
+            self.metrics_table = pd.concat([self.metrics_table, new_metrics_row], ignore_index=True)
+            self.metrics_table.to_csv(self.metric_file, index=False)
+            if self.metric_formats:
+                formatted_metrics = ', '.join([f'{k}={metrics[k]:{self.metric_formats[k]}}' for k in self.metric_formats if k in metrics])
+                if self.training_pbar is not None and formatted_metrics:
+                    self.training_pbar.set_extra(f"| {formatted_metrics}")
+                    if self.trainer.prediction_pbar is None:
+                        self.training_pbar.display_message()
 
 
 class GNERTrainer(Seq2SeqTrainer):
 
+    def __init__(self, *args, **kwargs):
+        self.max_generation_tokens = kwargs.pop("max_generation_tokens", 1280)
+        self.is_encoder_decoder = kwargs.pop("is_encoder_decoder", False)
+        self.progress_seconds = kwargs.pop("progress_seconds", 3.0)
+        self.prediction_pbar: Optional[ProgIter] = None
+        super().__init__(*args, **kwargs)
+
     def evaluation_loop(
-        self,
-        dataloader: DataLoader,
-        description: str,
-        prediction_loss_only: Optional[bool] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
+            self,
+            dataloader: DataLoader,
+            description: str,
+            prediction_loss_only: Optional[bool] = None,
+            ignore_keys: Optional[List[str]] = None,
+            metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
         """
         Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
@@ -57,12 +247,19 @@ class GNERTrainer(Seq2SeqTrainer):
 
         batch_size = self.args.eval_batch_size
 
-        logger.info(f"***** Running {description} *****")
-        if has_length(dataloader):
-            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
-        else:
-            logger.info("  Num examples: Unknown")
-        logger.info(f"  Batch size = {batch_size}")
+        if not self.args.do_train:
+            logger.info(hr(c='-'))
+            logger.info(f"***** Running {description} *****")
+            logger.info(f">> Train Model Type   = {self.model.config.model_type}")
+            logger.info(f">> Train Model Path   = {self.model.name_or_path}")
+            logger.info(f">> Train Model Class  = {self.model.__class__.__name__}")
+            logger.info(f">> Train Model Params = {get_model_param_count(self.model, trainable_only=True):,}")
+            if self.accelerator.state.deepspeed_plugin:
+                logger.info(f">> Zero Optim Stage   = {self.accelerator.state.deepspeed_plugin.deepspeed_config['zero_optimization']['stage']}")
+            if self.eval_dataset:
+                logger.info(f">> Eval Examples      = {len(self.eval_dataset):,}")
+                logger.info(f">> Eval Batch Size    = {self.args.eval_batch_size:,}"
+                            f" = {self.args.per_device_eval_batch_size} * {self.args.world_size}(gpu)")
 
         model.eval()
 
@@ -86,6 +283,14 @@ class GNERTrainer(Seq2SeqTrainer):
         all_labels = None
         all_inputs = None
         # Will be useful when we have an iterable dataset so don't know its length.
+        self.prediction_pbar = ProgIter(
+            time_thresh=self.progress_seconds,
+            verbose=3,
+            stream=LoggerWriter(logger),
+            total=len(dataloader),
+            desc="[checking]",
+        )
+        self.prediction_pbar.begin()
 
         observed_num_examples = 0
         # Main evaluation loop
@@ -99,11 +304,12 @@ class GNERTrainer(Seq2SeqTrainer):
                     batch_size = observed_batch_size
 
             # Prediction step
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            # loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys, max_new_tokens=self.max_generation_tokens)
             main_input_name = getattr(self.model, "main_input_name", "input_ids")
             inputs_decode = self._prepare_input(inputs[main_input_name]) if args.include_inputs_for_metrics else None
 
-            if is_torch_tpu_available():
+            if is_torch_xla_available():  # FutureWarning: `is_torch_tpu_available` is deprecated and will be removed in 4.41.0. Please use the `is_torch_xla_available` instead.
                 xm.mark_step()
 
             # Update containers on host
@@ -135,9 +341,9 @@ class GNERTrainer(Seq2SeqTrainer):
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
             if (
-                args.eval_accumulation_steps is not None
-                and (step + 1) % args.eval_accumulation_steps == 0
-                and (self.accelerator.sync_gradients or version.parse(accelerate_version) > version.parse("0.20.3"))
+                    args.eval_accumulation_steps is not None
+                    and (step + 1) % args.eval_accumulation_steps == 0
+                    and (self.accelerator.sync_gradients or version.parse(accelerate_version) > version.parse("0.20.3"))
             ):
                 if losses_host is not None:
                     losses = nested_numpify(losses_host)
@@ -198,7 +404,9 @@ class GNERTrainer(Seq2SeqTrainer):
 
         # Metrics!
         if self.compute_metrics is not None and all_preds is not None:
-            metrics = self.compute_metrics(dataset=eval_dataset, preds=all_preds, save_prefix=metric_key_prefix)
+            # metrics = self.compute_metrics(dataset=eval_dataset, preds=all_preds, save_prefix=metric_key_prefix, save_suffix=f"{self.state.global_step}")
+            metrics = self.compute_metrics(dataset=eval_dataset, preds=all_preds, save_prefix=metric_key_prefix, save_suffix=f"{self.state.global_step}",
+                                           output_dir=args.output_dir, tokenizer=self.processing_class, is_encoder_decoder=self.is_encoder_decoder)
         else:
             metrics = {}
 
