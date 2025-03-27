@@ -1,0 +1,16 @@
+accelerate               1.5.2
+chrisbase                0.5.9       /raid/chrisjihee/proj/HybridGNER/chrisbase
+chrisdata                0.5.1       /raid/chrisjihee/proj/HybridGNER/chrisdata
+deepspeed                0.16.4
+evaluate                 0.4.3
+flash_attn               2.7.4.post1
+numpy                    2.2.4
+progiter                 2.0.0.post1 /raid/chrisjihee/proj/HybridGNER/progiter
+pure_eval                0.2.3
+pydantic                 2.10.6
+pydantic_core            2.27.2
+sentencepiece            0.2.0
+seqeval                  1.2.2
+torch                    2.6.0+cu118
+torchmetrics             1.7.0
+transformers             4.51.0.dev0 /raid/chrisjihee/proj/HybridGNER/transformers
