@@ -1,0 +1,12 @@
+Anatomical_system
+Cancer
+Cell
+Cellular_component
+Developing_anatomical_structure
+Immaterial_anatomical_entity
+Multi-tissue_structure
+Organ
+Organism_subdivision
+Organism_substance
+Pathological_formation
+Tissue
